@@ -1,0 +1,273 @@
+---
+title: "CAT Bond Modeling"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+library(EnvStats)
+library(tidyverse)
+library(stats)
+library(raster)
+library(rgdal)
+library(sf)
+library(rgeos)
+
+knitr::opts_chunk$set(echo = TRUE)
+setwd("/users/matt/desktop/work/allfed/resilience/modeling")
+```
+
+Notes:
+* B20 / IMF - Resilience bonds
+* Iterate with them and present it to the various different ministers of finance.
+* Co-develop a case with them which they'll take the lead on
+* In conjunction maybe take it to aid agencies
+
+* Way we're looking at proposing: Under what circumstances, what would the trigger points be under which you would forfeit the principal.
+
+* Sponsor = either country or donor, or CERF
+* Transport costs = international grain stores
+* Stock variation
+
+Plan:
+* Domestic aquaculture project in Indonesia
+* Weather and supply chain shocks
+* Centralized Emergency Response Fund
+
+Start with climate risk then do volcanic and pandemic. Do the back-of-the-envelope model for Indonesia. Keep it high-level to start with.
+
+# Modeling References
+
+1. [Catastrophe Modeling: Guidance for Non-Catastrophe Modellers](https://www.lmalloyds.com/lma/finance/Cat_Modelling_Guidance.aspx)
+2. [A Guide to Catastrophe Modeling](https://forms2.rms.com/rs/729-DJX-565/images/rms_guide_catastrophe_modeling_2008.pdf)
+3. [Establishing flood damage functions for agricultural crops using estimated inundation depth and flood disaster statistics in data-scarce regions](https://www.jstage.jst.go.jp/article/hrl/11/1/11_12/_article)
+4. [Evaluating CAT Bond Pricing Methods](https://pdfs.semanticscholar.org/c2d2/2651f9cc8504a998f8da4ef2a73c4a2d63ef.pdf)
+5. [Modeling the Potential Impact of Catastrophic Weather on Crop Insurance Industry Portfolio Losses](https://www.researchgate.net/publication/23521744_Modeling_the_Potential_Impact_of_Catastrophic_Weather_on_Crop_Insurance_Industry_Portfolio_Losses)
+6. [Income Elasticities and Global Values of a
+Statistical Life](https://law.vanderbilt.edu/phd/faculty/w-kip-viscusi/355_Income_Elasticities_and_Global_VSL.pdf) (unused here but included as a reference for later)
+
+# Background
+* [Financing Catastrophe Risk for Famine Relief Using Early Warning Systems](http://globalagrisk.com/Pubs/2002%20Financing%20Catastrophe%20Risk%20for%20Famine%20Relief%20Using%20Early%20Warning%20jrs.pdf)
+* [2004 *Economist* article on potential WFP famine insurance](https://www.economist.com/finance-and-economics/2004/12/09/hedging-against-the-horsemen)
+
+# Aquaculture references
+* [The Relative Caloric Prices of Healthy and Unhealthy Foods Differ Systematically across Income Levels and Continents](https://academic.oup.com/jn/article/149/11/2020/5535433)
+* [The Future of Food from the Sea](https://oceanpanel.org/sites/default/files/2019-11/19_HLP_BP1%20Paper.pdf)
+
+# Helpful Miscellany
+* [Bond valuation on Investopedia](https://www.investopedia.com/terms/b/bond-valuation.asp)
+* [A useful blog post](https://understandinguncertainty.org/node/622)
+* [Overnight risk-free rates: A User's Guide](https://www.fsb.org/wp-content/uploads/P040619-1.pdf)
+
+
+From (4):
+
+> *From the sponsor perspectives, CAT bonds provides full collateralized losses as compared to reinsurance; they eliminate the concerns about credit risk. The investors pay a principal to obtain the CAT Bond and receive as return a regular periodic payments, generally quarterly or semi-annually. The interest or the coupons paid to the investors are from the premium and the proceeds form the investment bonds received by the SPV from the collateral.*
+
+> *If the trigger event (covered event) does not occur during the life of the CAT bond, the investors will receive the principal plus the final coupon or a generous interest (a compensation for the catastrophe risk exposure). The coupons are generally paid quarterly, but they can also be semi-annual or annual depending on the contract. CAT bonds are remunerated at LIBOR plus a yield (spread or risk premium). The spread is a remuneration for the unpredictable property of natural disasters. So the total coupon rate(%) is equal to the LIBOR(%) plus de spread(%). The spread is the price of the risk.*
+
+
+# Parameters
+
+```{r}
+
+# Parameters
+
+######## Modeling ########
+n <- 10000 # number of simulations
+
+### Insurance assumptions
+
+policy.amount = 1000000 # This is the amount of insurance the sponsor wants to purchase, which is also the amount to be raised by a CAT bond issue
+
+######## Food supply assumptions ########
+
+# per capita additional calories needed each year to avert one famine dath
+annual.percap.aversion.calories <- 300 * 10**3 # 300,000 = basically half of one person's daily energy supply for a year
+aquaculture.calorie.cost <- 0.001 # one tenth of a cent
+
+######## Bond assumptions ########
+
+risk.free.rate.overnight <- 0.000604 # Secured Overnight Financing rate - recommended as alternative to LIBOR as risk-free rate. We should really take today's SOFR overnight rate and annualize it, but this is a quote of the 1-year strip rate from https://www.cmegroup.com/trading/interest-rates/sofr-strip-rates.html
+  
+bond.term <- 5 # years
+expense.ratio <- 0.15 # this seems standard but is just a guess
+
+```
+
+# Historical data
+
+```{r}
+
+# Historical data for indonesia
+# CURRENTLY UNUSED
+# Source: http://www.fao.org/faostat/en/#data/FS
+
+fao.indonesia <- read.csv("FAOSTAT_data_8-13-2020.csv")
+indonesia.supply.variability <- fao.indonesia %>% subset(Element.Code == 21031)
+
+```
+
+# Modules
+
+## 1) Exposure module
+
+**Module purpose**: Define the hazard phenomena: for example, weather events that may impact the food supply. Simulate these events to get a distribution for their frequency and severity.
+
+Data source: https://gisclimatechange.ucar.edu/gis-data-ar5
+
+countries from: https://hub.arcgis.com/datasets/a21fdb46d23e4ef896f31475217cbb08_1/data
+
+```{r}
+
+# Module 1: Exposure / Stochastic event module
+
+#######################################################################
+######## A. Read in IPCC GIS data and mean monthly projections ######## 
+#######################################################################
+
+globe <- readOGR("data/climate/Longitude_Graticules_and_World_Countries_Boundaries-shp")
+indonesia.only <- globe[globe@data$CNTRY_NAME == "Indonesia",]
+
+# polygons
+ccsm.polygons <- readOGR("data/climate/CCSM_polygons")
+
+# data points, each of which corresponds to a CCSM grid square
+climate.projections <- readOGR("data/climate/tasmin_all_2021_2026_rcp45-180.0_180.0_-90.0_90.0")
+
+# combine ccsm gis data
+crs(climate.projections) <- "+proj=longlat +R=6371220 +no_defs"
+all.ccsm.data <- ccsm.polygons
+all.ccsm.data@data <- over(ccsm.polygons, climate.projections)
+all.ccsm.data <- spTransform(all.ccsm.data, "+init=epsg:4326")
+
+# plot the whole world!
+#spplot(all.ccsm.data, "X202612", col="transparent")
+
+indonesia.data <- intersect(all.ccsm.data, indonesia.only)
+
+# plot indonesia only
+spplot(indonesia.data, "X202612", col="transparent")
+
+#######################################################################
+############## B. ADD UNCERTAINTY TO INDONESIA PROJECTS ###############
+#######################################################################
+
+# see: https://pcmdi.llnl.gov/mips/cmip5/
+
+
+```
+
+## 2) Hazard module
+
+**Module purpose**: Quantify the impact that the events described in the module (1) have on the food supply. Estimate a distribution of food supply shocks over all locations of interest
+
+```{r}
+
+# Module 2: Hazard
+
+# hazard: likelihood of a famine
+
+# EMPTY NOW - To-do here is to model the effect of the drivers in (1) on calorie supply
+
+
+```
+
+
+## 3) Vulnerability module
+
+**Module purpose**: Combine exposure and hazard modules to estimate the potential damage at each location of interest.
+
+```{r}
+
+# Module 3: Vulnerability
+
+# This is a kludge for now - this section needs to be replaced with loss curves derived from (1) and (2)
+
+likelihood.of.famine <- rbinom(n, 1, 0.07) # indonesia has been in famine for 7 of the last 100 years
+severity.of.famine <- rexp(n, 1/10000) # midpoint estimate of famine deaths is around 70k for the 7-year famine, so 10k/year
+famine.expected.deaths <- likelihood.of.famine * severity.of.famine
+
+
+```
+
+## 4) Financial module
+
+**The EP Curve**:
+
+From Lloyds:
+
+> *It is important to note that this refers to a loss being exceeded, and not the exact loss itself. This approach is used for cat modelling, as it is beneficial to identify attachment or exhaustion probabilities, calculate expected losses within a given range, or to provide benchmarks for comparisons between risks or over time. Calculating the probability of an exact financial loss is of little value.*
+
+**Module purpose**: Translate physical damage into monetary cost
+
+```{r}
+
+# Module 4: Financial module
+
+#### PART 1: Compute lives lost as calorie shortfall
+
+loss.as.calories <- famine.expected.deaths * annual.percap.aversion.calories
+
+#### PART 2: Compute calorie shortfall as 
+
+loss.curve <- loss.as.calories * aquaculture.calorie.cost
+
+# Average annual loss = area under the EP curve = sum product of mean loss and annual likelihood of occurrence - AAL is also known as the "pure premium."
+# good reference for AAL: air-worldwide.com/publications/air-currents/2013/Modeling-Fundamentals--What-Is-AAL-/
+
+aal <- mean(loss.curve)
+
+# Here we come up with the exceedance probability (EP) curve: probability of exceeding the given amount in any given year. This can also be expressed as table (probability/loss/return period). It's just another way of visualizing the loss distribution.
+
+loss.amount <- seq(from = 0, to = max(loss.curve), length.out=n)
+ep <- sapply(loss.amount, function(x) { return(mean(loss.curve > x)) }, simplify="vector")
+plot(loss.amount, ep, type="l") # plot EP curve
+
+# Get coefficient of variation for loss curve: CV = normalized variation
+# Variability of loss curve = risk => affects premium
+sd.loss <- sd(loss.curve)
+cv <- sd.loss/aal
+
+
+```
+
+# Bond pricing
+
+* The **pure premium** is the ratio of losses to exposure units, and is defined as the part of the premium necessary to cover losses and loss related expenses.
+* However, the ultimate premium also includes **loading**, which is the part of the premium that covers profit and expenses for the insurer.
+* **Gross rate** = pure premium + load. However, since loading charges increase proportionally with the premium, additional expenses are expressed as an **expense ratio**. So:**Gross rate** = Pure premium / (1 - expense ratio)
+* The **gross premium** is the gross rate times the number of units to be insured. In this iteration, we insure only one unit (the whole country of Indonesia!) so gross rate = gross premium here.
+```{r }
+
+# CAT Bond pricing
+
+###### Gross premium ######
+gross.premium = aal / (1 - expense.ratio)
+
+###### Bond ######
+
+# Bond delivers gross.premium worth of coverage for bond.term years and is apparently treated as defaultable
+
+bond.face.value <- policy.amount
+default.risk <- mean(loss.curve > bond.face.value)
+issuer.profit <- 0 # assuming for now that the bond issuer is taking the premium and paying them out directly as coupons without taking profit or expenses
+coupon.amount <- gross.premium + issuer.profit
+
+# The interest rate on a CAT bond is equal to the risk-free rate (historically LIBOR but here SOFR) plus the spread
+
+# EMPTY NOW
+
+```
+
+# Resilience rebate
+
+```{r }
+
+# Resilience rebate
+
+# EMPTY NOW: This will be calculated by packaging the above modules into a function and calculating the gross premiums in the real world and in the counterfactual with-aquaculture scenario.
+
+
+```
