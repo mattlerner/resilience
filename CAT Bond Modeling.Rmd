@@ -13,6 +13,7 @@ library(raster)
 library(rgdal)
 library(sf)
 library(rgeos)
+library(ncdf4)
 
 knitr::opts_chunk$set(echo = TRUE)
 setwd("/users/matt/desktop/work/allfed/resilience/modeling")
@@ -115,9 +116,12 @@ indonesia.supply.variability <- fao.indonesia %>% subset(Element.Code == 21031)
 
 **Module purpose**: Define the hazard phenomena: for example, weather events that may impact the food supply. Simulate these events to get a distribution for their frequency and severity.
 
-Data source: https://gisclimatechange.ucar.edu/gis-data-ar5
 
-countries from: https://hub.arcgis.com/datasets/a21fdb46d23e4ef896f31475217cbb08_1/data
+### Data: 
+* [Data source for temperature data](https://gisclimatechange.ucar.edu/gis-data-ar5)
+* [Data source for historical yield data](https://www.nature.com/articles/s41597-020-0433-7)
+  * [Downloaded here](https://pangaea.figshare.com/articles/Global_dataset_of_historical_yields_v1_2_and_v1_3_aligned_version/11960784/1)
+* [Country Boundaries](https://hub.arcgis.com/datasets/a21fdb46d23e4ef896f31475217cbb08_1/data)
 
 ```{r}
 
@@ -129,6 +133,7 @@ countries from: https://hub.arcgis.com/datasets/a21fdb46d23e4ef896f31475217cbb08
 
 globe <- readOGR("data/climate/Longitude_Graticules_and_World_Countries_Boundaries-shp")
 indonesia.only <- globe[globe@data$CNTRY_NAME == "Indonesia",]
+us.only <- globe[globe@data$CNTRY_NAME == "United States",]
 
 # polygons
 ccsm.polygons <- readOGR("data/climate/CCSM_polygons")
@@ -151,17 +156,52 @@ indonesia.data <- intersect(all.ccsm.data, indonesia.only)
 spplot(indonesia.data, "X202612", col="transparent")
 
 #######################################################################
-############## B. ADD UNCERTAINTY TO INDONESIA PROJECTS ###############
+############ B. ADD UNCERTAINTY TO INDONESIA PROJECTIONS ##############
 #######################################################################
 
 # see: https://pcmdi.llnl.gov/mips/cmip5/
+# TODO HERE (down the line): Read in multiple ensembles and use inter-ensemble variance to derive uncertainty around future climate. See Strobach and Bel 2017.
 
+
+#######################################################################
+#################### C. HISTORICAL TEMPERATURE DATA ###################
+#######################################################################
+
+climate.history <- readOGR("tas_all_1850_1850_historical-180.0_180.0_-90.0_90.0")
+
+# back to here to get indonesia only
+
+#######################################################################
+#################### D. HISTORICAL CROP YIELD DATA ####################
+#######################################################################
+
+# how to read nc files in r
+# https://rpubs.com/boyerag/297592
+
+nc_test <- nc_open("data/crops/10.1594_PANGAEA.909132/maize/yield_2008.nc4")
+lon <- ncvar_get(nc_test, "lon") # longitude should be [-180, 180]
+lat <- ncvar_get(nc_test, "lat")
+var <- ncvar_get(nc_test, "var")
+
+
+r <- raster(t(var), xmn=min(lon), xmx=max(lon), ymn=min(lat), ymx=max(lat), crs="+init=epsg:4326")
+r <- rotate(r)
+r <- flip(r, direction='y')
+
+indonesia_r <- intersect(r, indonesia.only)
+plot(indonesia_r)
+
+#######################################################################
+########## E. MODEL RELATIONSHIP BETWEEN TEMP AND YIELD ###############
+#######################################################################
 
 ```
 
 ## 2) Hazard module
 
 **Module purpose**: Quantify the impact that the events described in the module (1) have on the food supply. Estimate a distribution of food supply shocks over all locations of interest
+
+In general, impacts of climate on agricultural yield are estimated using either **process models** or **statistical models** (Cai et al 2017). The former is based on a simulation approach integrating weather information with theory-based rules from biology, physics, and chemistry. In contrast, the latter often take a simple regression approach, modeling crop yield as a function of historical temperature data. Statistical models require less--or at least less granular--data, and are more practicable across large geographical areas.
 
 ```{r}
 
