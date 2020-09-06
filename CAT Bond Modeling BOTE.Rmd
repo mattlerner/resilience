@@ -1,0 +1,215 @@
+---
+title: "CAT Bond Modeling - Back of the Envelope"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+library(EnvStats)
+library(tidyverse)
+library(stats)
+library(raster)
+library(rgdal)
+library(sf)
+library(rgeos)
+library(ncdf4)
+library(rstan)
+
+knitr::opts_chunk$set(echo = TRUE)
+setwd("/users/matt/desktop/work/allfed/resilience/modeling")
+```
+
+# Parameters
+
+```{r}
+
+# Parameters
+
+######## Modeling ########
+n <- 10000 # number of simulations
+
+warming <- c(0.05,1,1.5)
+
+```
+
+# Modules
+
+## Exposure module
+
+**Module purpose**: Define the hazard phenomena: for example, weather events that may impact the food supply. Simulate these events to get a distribution for their frequency and severity.
+
+At this stage, we use historical temperature data to derive a distribution for maximum air temperature during the growing season. Historical data comes from the [FAO](http://www.fao.org/3/y4347e/y4347e0x.htm). Indonesia has several growing seasons, so we treat the distribution as a "bag of growing months." Preliminarily, we treat all months and locations as the same for back-of-the-envelope purposes. We fit a distribution to this figure.
+
+```{r}
+
+# We want to come up with an annual distribution for mean growing season temperatures in Indonesia. For now, we use the last thirty years of data and assume a Gaussian distribution
+
+earliest.year <- 1990
+
+# It's planting season almost every month in various parts of Indonesia
+growing.season.months <- c("MAR","APR","MAY","JUN","AUG","SEP","OCT","NOV","DEC")
+
+history <- read.delim("data/temperature/ind.txt", sep="", skip=3) # historical monthly temperature data
+history.small <- history %>% subset(YEAR >= earliest.year) %>% dplyr::select(growing.season.months)
+
+#mean.temperatures <- unlist(history.small) # frame to vector of months
+mean.temperatures <- rowMeans(history.small) # here averaging across growing season months to get a "mean growing season temperature"
+
+# Fit a distribution to mean temperatures (very simple stan model)
+data <- list(temp=mean.temperatures, N=length(mean.temperatures))
+temperature.fit <- stan("temp_model.stan", data=data)
+posterior <- extract(temperature.fit)
+
+# Fetch parameters - median of the posterior distribution for each
+mean_ <- median(posterior$mean_)
+sigma_ <- median(posterior$sigma)
+
+# Generate n samples according to model parameters (in this case normal)
+
+### Temperature dist
+temperatures <- rnorm(n, mean_, sigma_)
+
+```
+
+## 2) Hazard module
+
+**Module purpose**: Quantify the impact that the events described in the module (1) have on the food supply. Estimate a distribution of food supply shocks over all locations of interest.
+
+Historical crop production data from [FAO](http://www.fao.org/faostat/en/#data/QC/visualize).
+
+```{r}
+
+# source: http://www.fao.org/faostat/en/#data/QC/visualize
+
+fao.all <- read.csv("data/fao/Production_Crops_E_All_Data/Production_Crops_E_All_Data.csv")
+fao.indonesia.rice <- fao.all %>% subset(Area == "Indonesia" & Item.Code == 27 & Element.Code == 5510) # historical rice production in Indonesia
+indonesia.rice.reshaped <- data.frame(year=colnames(fao.indonesia.rice), value=c(t(fao.indonesia.rice)))
+indonesia.rice.years <- indonesia.rice.reshaped %>% mutate(year = as.numeric(str_extract(year, "(?<=Y)[0-9][0-9][0-9][0-9]$")), value=as.numeric(value)) %>% subset(!is.na(year))
+
+# shortcut to projecting the next five years: linear regression over the past thirty to get a trendline, then predict 2.5 years down the road and extract gaussian values around it
+trend <- lm(value ~ year, data=indonesia.rice.years)
+prediction_2.5 <- predict.lm(trend, data.frame(year=2026))
+
+### Yield dist
+yields <- rnorm(n, prediction_2.5, sd(indonesia.rice.years[-5:-1,'value'])) # using the variance over the past five years
+
+```
+
+## 3) Vulnerability module
+
+**Module purpose**: Combine exposure and hazard modules to estimate the potential damage at each location of interest (in this case the whole country).
+
+Here we just assume an effect of temperature on yield based on estimates from [2]: -8.3% plus or minus 1.4% yield loss per degree Kelvin of warming (K = C + 273.15).
+
+```{r}
+
+yield.percentage.change <- (temperatures - mean(temperatures) + 1) * rnorm(n, -0.083, 0.007)
+yield.total.change <- yields*yield.percentage.change
+
+# set non-losses to 0.
+lost.yields.only <- yield.total.change
+lost.yields.only[lost.yields.only > 0] <- 0
+lost.yields.only <- abs(lost.yields.only)
+
+```
+
+## 4) Financial module
+
+**Module purpose**: Translate physical damage into monetary cost
+
+As of right now, the [wholesale price](https://www.tridge.com/intelligences/rice/ID) of Indonesian rice is \$0.78/kg, or \$780 / ton. We convert crop production losses into dollar amounts using this figure.
+
+```{r}
+
+cost.per.ton.of.rice <- 780
+
+loss.curve <- lost.yields.only * cost.per.ton.of.rice
+
+# Average annual loss = area under the EP curve = sum product of mean loss and annual likelihood of occurrence - AAL is also known as the "pure premium."
+# good reference for AAL: air-worldwide.com/publications/air-currents/2013/Modeling-Fundamentals--What-Is-AAL-/
+
+aal <- mean(loss.curve)
+
+# Here we come up with the exceedance probability (EP) curve: probability of exceeding the given amount in any given year. This can also be expressed as table (probability/loss/return period). It's just another way of visualizing the loss distribution.
+
+loss.amount <- seq(from = 0, to = max(loss.curve), length.out=n)
+ep <- sapply(loss.amount, function(x) { return(mean(loss.curve > x)) }, simplify="vector")
+plot(loss.amount, ep, type="l") # plot EP curve
+
+# Get coefficient of variation for loss curve: CV = normalized variation
+# Variability of loss curve = risk => affects premium
+sd.loss <- sd(loss.curve)
+cv <- sd.loss/aal
+
+
+```
+
+# Bond pricing
+
+The United Nations Central Emergency Response Fund ([CERF](https://cerf.un.org/what-we-do/allocation/2020/sector/29/20-RR-SSD-40943/20-RR-WFP-015)) disburses food aid in the event of some severe food catastrophes. Recently, CERF disbursed $15m to feed 90,000 people over an 8-month period in South Sudan, suggesting a cost of ~\$160 per person over the time period.
+
+We suppose here that CERF would want to insure against the equivalent of a roughly 2% loss in rice production in Indonesia relative to this year's production (~1.6 million tons), and assume conservatively that they insure rice at its wholesale market rate.
+
+```{r }
+
+bond.term = 5
+
+#### Policy amount
+
+rice.production.this.year <- 80000000 # rounded
+production.loss <- 0.02
+policy.amount <- rice.production.this.year * production.loss * cost.per.ton.of.rice
+
+### Bond stuff
+bond.face.value <- policy.amount
+payout.risk <- mean(loss.curve > bond.face.value)
+
+# Setting annual coupon to expected loss with annual payours
+coupon <- payout.risk / bond.term
+
+###### Other (currently unused) ######
+
+expense.ratio = 0.15 # apparently standard
+gross.premium = aal / (1 - expense.ratio)
+
+```
+
+# Data sources
+
+A. [Climate research unit - monthly temperature data](https://crudata.uea.ac.uk/cru/data/hrg/cru_ts_4.03/crucy.1905151143.v4.03/new_countries/)
+
+# End notes
+
+1. [Assessing risks of climate variability and climate change for Indonesian rice agriculture](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1876519/)
+2. [Plausible rice yield losses under future climate warming](https://www.nature.com/articles/nplants2016202#:~:text=More%20than%2080%25%20(67%20out,%25%20K%E2%88%921%20(Fig.)
+3. [Food security, farming and climate change to 2050](https://www.ifpri.org/publication/food-security-farming-and-climate-change-2050)
+
+# Modeling References
+
+1. [Catastrophe Modeling: Guidance for Non-Catastrophe Modellers](https://www.lmalloyds.com/lma/finance/Cat_Modelling_Guidance.aspx)
+2. [A Guide to Catastrophe Modeling](https://forms2.rms.com/rs/729-DJX-565/images/rms_guide_catastrophe_modeling_2008.pdf)
+3. [Establishing flood damage functions for agricultural crops using estimated inundation depth and flood disaster statistics in data-scarce regions](https://www.jstage.jst.go.jp/article/hrl/11/1/11_12/_article)
+4. [Evaluating CAT Bond Pricing Methods](https://pdfs.semanticscholar.org/c2d2/2651f9cc8504a998f8da4ef2a73c4a2d63ef.pdf)
+5. [Modeling the Potential Impact of Catastrophic Weather on Crop Insurance Industry Portfolio Losses](https://www.researchgate.net/publication/23521744_Modeling_the_Potential_Impact_of_Catastrophic_Weather_on_Crop_Insurance_Industry_Portfolio_Losses)
+6. [Income Elasticities and Global Values of a Statistical Life](https://law.vanderbilt.edu/phd/faculty/w-kip-viscusi/355_Income_Elasticities_and_Global_VSL.pdf) (unused here but included as a reference for later)
+7. [Modeling Uncertainty in Climate
+Change: A Multi-Model Comparison](https://globalchange.mit.edu/sites/default/files/MITJPSPGC_Rpt290.pdf)
+8. [An Evaluation of Decadal Probability Forecasts from State-of-the-Art Climate Models](https://journals.ametsoc.org/jcli/article/26/23/9334/99441/An-Evaluation-of-Decadal-Probability-Forecasts)
+  * Features "probability forecasts from ensembles" - using kernel dressing
+
+# Indonesia
+* [Rice growing seasons in Indonesia](http://www.fao.org/3/y4347e/y4347e0x.htm)
+
+# Background
+* [Financing Catastrophe Risk for Famine Relief Using Early Warning Systems](http://globalagrisk.com/Pubs/2002%20Financing%20Catastrophe%20Risk%20for%20Famine%20Relief%20Using%20Early%20Warning%20jrs.pdf)
+* [2004 *Economist* article on potential WFP famine insurance](https://www.economist.com/finance-and-economics/2004/12/09/hedging-against-the-horsemen)
+
+# Aquaculture references
+* [The Relative Caloric Prices of Healthy and Unhealthy Foods Differ Systematically across Income Levels and Continents](https://academic.oup.com/jn/article/149/11/2020/5535433)
+* [The Future of Food from the Sea](https://oceanpanel.org/sites/default/files/2019-11/19_HLP_BP1%20Paper.pdf)
+
+# Helpful Miscellany
+* [Bond valuation on Investopedia](https://www.investopedia.com/terms/b/bond-valuation.asp)
+* [A useful blog post](https://understandinguncertainty.org/node/622)
+* [Overnight risk-free rates: A User's Guide](https://www.fsb.org/wp-content/uploads/P040619-1.pdf)
