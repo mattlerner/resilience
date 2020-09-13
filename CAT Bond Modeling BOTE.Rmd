@@ -131,7 +131,7 @@ loss.curve.yields <- function(temp.vector, yield.vector, increase) {
   return(lost.yields.only)
 }
 
-lost.yields.only <- loss.curve.yields(temperatures, yields, 0)
+lost.yields.only <- loss.curve.yields(temperatures, yields, 0.07)
 
 ```
 
@@ -185,6 +185,10 @@ AIR [presentation](https://www.cia-ica.ca/docs/default-source/2018/218103e.pdf) 
 
 ```{r, warning=FALSE}
 
+# set the maximum point on the EP curve to integrate up to
+# this will reduce the sensitivity of the calculation to changes in the number of simulations
+maximum.ep.curve.value <- 3400000000
+
 bond.term = 5
 rice.production.lost <- 0.05
 base.rice.production <- 80000000
@@ -215,7 +219,7 @@ policy.amount <- calculate.policy.amount(rice.production.lost, base.rice.product
 calculate.average.rate <- function(ep.curve, policy.amount.input) {
 
   # Calculate the area under the curve to the right of the policy amount we target - this is the AAL. We use trapezoidal rule here to calculate AUC.
-  ep <- ep.curve[ep.curve$amount >= policy.amount.input,]
+  ep <- ep.curve[ep.curve$amount >= policy.amount.input,]# & ep.curve$amount <= maximum.ep.curve.value,]
   id <- order(ep$amount)
   x <- ep$amount
   y = ep$prob
@@ -246,7 +250,7 @@ calculate.average.rate <- function(ep.curve, policy.amount.input) {
 }
 
 premium <- calculate.average.rate(ep.0, policy.amount)
-
+premium
 # print(paste("Expected premium assuming insured production loss of",loss,"and price per ton of",cost.per.ton.of.rice,":",premium$premium*100,"%"))
 
 ```
@@ -275,16 +279,20 @@ fat.per.seaweed.gram <- 0.5
 calories.per.carb.gram <- 4
 calories.per.fat.gram <- 4
 calories.per.protein.gram <- 9
-calories.per.ton.of.seaweed <- ((carbs.per.seaweed.gram*calories.per.carb.gram) + (protein.per.seaweed.gram * calories.per.protein.gram) + (fat.per.seaweed.gram * calories.per.fat.gram)) * (1000000/100) # 1m grams per tonne, but estimates are per 100h
+calories.per.ton.of.seaweed <- ((carbs.per.seaweed.gram*calories.per.carb.gram) + (protein.per.seaweed.gram * calories.per.protein.gram) + (fat.per.seaweed.gram * calories.per.fat.gram)) * (1000000/100) # 1m grams per tonne, but estimates are per 100g
 
 # calculate value of aquaculture project based on replacement cost
 lost.rice.calories <- base.rice.production*rice.production.lost*calories.per.ton.of.rice
-percentage.replaced <- 0.2
+percentage.replaced <- 0.3
 aquaculture.replacement.cost <- (lost.rice.calories / calories.per.ton.of.seaweed) * aquaculture.cost.per.ton * percentage.replaced
 reduced.payout <- policy.amount*percentage.replaced
 
+# aquaculture project cost
+aquaculture.replacement.cost
+
 # calculate rebate
 loss.curve.1 <- loss.curve - reduced.payout
+loss.curve.1[loss.curve.1 < 0] <- 0
 ep.1 <- get.ep.curve(loss.curve.1)
 plot(ep.1$amount, ep.1$prob, type="l", main="Probability of exceeding a given value of lost rice (USD)") # plot EP curve
 premium.1 <- calculate.average.rate(ep.1, policy.amount)
@@ -298,30 +306,8 @@ rebate/aquaculture.replacement.cost
 
 
 
-
 ```
 
-
-# EP curves for differing assumptions
-
-```{r, warning=FALSE, message=FALSE, fig.show="hold", out.width="50%"}
-
-warming <- c(0.07,1,1.5)
-production.loss <- c(0.01,0.02,0.05,0.2)
-
-for (w in warming) {
-  for (p in production.loss) {
-    rice.losses <- loss.curve.yields(temperatures, yields, w)
-    dollar.losses <- loss.curve.dollars(rice.losses, cost.per.ton.of.rice)
-    ep <- ep.curve(dollar.losses)
-    premium <- premium.estimate(p, dollar.losses)
-    plot(ep$amount, ep$prob, type="l", main=paste(w, "degrees warming\n",p*100 ,"% production loss\n",premium$premium*100,"% premium")) # plot EP curve
-    abline(v = premium$policy, col="blue", add=TRUE)
-  }
-}
-
-
-```
 
 
 # A. Data sources
