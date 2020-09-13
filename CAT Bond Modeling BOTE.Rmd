@@ -15,6 +15,7 @@ library(sf)
 library(rgeos)
 library(ncdf4)
 library(rstan)
+library(zoo)
 
 knitr::opts_chunk$set(echo = TRUE)
 setwd("/users/matt/desktop/work/allfed/resilience/modeling")
@@ -147,31 +148,23 @@ loss.curve.dollars <- function(lost.yields, cost) {
   return(dollars.lost)
 }
 
-cost.per.ton.of.rice <- 780
-loss.curve <- loss.curve.dollars(lost.yields.only, cost.per.ton.of.rice)
-
-
-# Average annual loss = area under the EP curve = sum product of mean loss and annual likelihood of occurrence - AAL is also known as the "pure premium."
-# good reference for AAL: air-worldwide.com/publications/air-currents/2013/Modeling-Fundamentals--What-Is-AAL-/
-
-aal <- mean(loss.curve)
-
-# Here we come up with the exceedance probability (EP) curve: probability of exceeding the given amount in any given year. This can also be expressed as table (probability/loss/return period). It's just another way of visualizing the loss distribution.
-
-ep.curve <- function(loss.curve) {
-  loss.amount <- seq(from = 0, to = max(loss.curve), length.out=n)
-  ep <- sapply(loss.amount, function(x) { return(mean(loss.curve > x)) }, simplify="vector")
+get.ep.curve <- function(loss.curve.input) {
+  loss.amount <- seq(from = 0, to = max(loss.curve.input), length.out=n)
+  ep <- sapply(loss.amount, function(x) { return(mean(loss.curve.input > x)) }, simplify="vector")
   return(data.frame(amount=loss.amount, prob=ep))
 }
 
-ep.0 <- ep.curve(loss.curve)
+cost.per.ton.of.rice <- 780
+loss.curve <- loss.curve.dollars(lost.yields.only, cost.per.ton.of.rice)
+
+ep.0 <- get.ep.curve(loss.curve)
 
 plot(ep.0$amount, ep.0$prob, type="l", main="Probability of exceeding a given value of lost rice (USD)") # plot EP curve
 
 # Get coefficient of variation for loss curve: CV = normalized variation
 # Variability of loss curve = risk => affects premium
-sd.loss <- sd(loss.curve)
-cv <- sd.loss/aal
+# can be calculated as the area under the EP curve or as the sum product of the mean loss and the annual likelihood of occurrence (ie, the event rate) for each event in the event set
+# and can be used to evaluate the catastrophe load portion of an insurance rating function. AAL is often referred to as the pure premium or burn cost.
 
 ```
 
@@ -181,31 +174,133 @@ The United Nations Central Emergency Response Fund ([CERF](https://cerf.un.org/w
 
 We suppose here that CERF would want to insure against the equivalent of a roughly 2% loss in rice production in Indonesia relative to this year's production (~1.6 million tons), and assume conservatively that they insure rice at its wholesale market rate.
 
+Basic ratemaking calculations for premium are sourced [here](https://www.casact.org/education/rpm/2012/handouts/Session_4764_presentation_965_0.pdf).
+
+AIR [presentation](https://www.cia-ica.ca/docs/default-source/2018/218103e.pdf) on CAT bonds and pricing.
+
+[How to calculate AAL](https://www.air-worldwide.com/publications/air-currents/2013/Modeling-Fundamentals--What-Is-AAL-/)
+
+[Calculating risk load](https://www.casact.org/education/ratesem/2004/handouts/musulin.pdf)
+
+
 ```{r, warning=FALSE}
 
 bond.term = 5
+rice.production.lost <- 0.05
+base.rice.production <- 80000000
+
+calculate.policy.amount <- function(rice.production.loss, rice.production) {
+  policy.amount <- rice.production.loss*rice.production*cost.per.ton.of.rice
+  return(policy.amount)
+}
+
+policy.amount <- calculate.policy.amount(rice.production.lost, base.rice.production)
 
 #### Policy amount
 
-premium.estimate <- function(lost.production, dollar.losses) {
-  rice.production.this.year <- 80000000 # rounded
-  policy.amount <- rice.production.this.year * lost.production * cost.per.ton.of.rice
-  payout.risk <- mean(dollar.losses > policy.amount)
-  premium.estimate <- payout.risk / bond.term
-  return(list(premium = premium.estimate, policy=policy.amount))
+# See source D.1
+# average rate = (AAL + Risk Load + Fixed Expense)/(1 - Variable expense and profit ratio)
+# Average risk load = (R * Sd) / (Exposure)
+# Where sd is the standard deviation of the loss experience (calculated above)
+# R is reluctance factor calculated according to "kreps" formula:
+# R = (y * Z) / (1 + y)
+# y = expected return => pick 10% as desired portfolio yield
+# Z = "distribution percentage point corresponding to an acceptable probability that the actual result will require more surplus allocated" = 1.645 corresponds to 95%
+
+# To investigate:
+# variable permissible loss ratio?
+# z-score below (!!!)
+# exposure vs pure premium
+
+calculate.average.rate <- function(ep.curve, policy.amount.input) {
+
+  # Calculate the area under the curve to the right of the policy amount we target - this is the AAL. We use trapezoidal rule here to calculate AUC.
+  ep <- ep.curve[ep.curve$amount >= policy.amount.input,]
+  id <- order(ep$amount)
+  x <- ep$amount
+  y = ep$prob
+  AUC <- sum(diff(x[id])*rollmean(y[id],2))
+  aal <- AUC
+  sd.loss <- sd(ep$amount)
+  
+  exposure <- 1 # insured unit-years so- 1 country, Indonesia, in 1 year.
+  pure.premium <- aal/exposure
+  y <- 0.1      # desired portfolio yield
+  z <- 1.645    # z-score for prob that actual result will require more surplus allocated
+  R = (y * z)/(1 + y)  # reluctance factor
+  risk.load <- (R * sd.loss)/exposure # replace with CV?
+  
+  # Components of variable expense and profit - values taken from example in source D.1
+  commissions <- 0.2
+  premium.tax <- 0.04
+  underwriting.profit.provision <- 0.05
+  trend.adjustment <- 0 # this is in the example but we leave it out for now
+  fixed.expense = 25
+  
+  variable.expense.and.profit <- (commissions + premium.tax + underwriting.profit.provision) + trend.adjustment
+  
+  # This is the average rate, with assumed reinsurance = 0.
+  # We still need to adjust this to get the per-unit premium
+  average.rate <- (pure.premium + risk.load + fixed.expense) / (1 - variable.expense.and.profit)
+  return(average.rate)
 }
 
-loss <- 0.02
-premium <- premium.estimate(0.02, loss.curve)
+premium <- calculate.average.rate(ep.0, policy.amount)
 
-###### Other (currently unused) ######
-
-expense.ratio = 0.15 # apparently standard
-gross.premium = aal / (1 - expense.ratio)
-
-print(paste("Expected premium assuming insured production loss of",loss,"and price per ton of",cost.per.ton.of.rice,":",premium$premium*100,"%"))
+# print(paste("Expected premium assuming insured production loss of",loss,"and price per ton of",cost.per.ton.of.rice,":",premium$premium*100,"%"))
 
 ```
+
+# Resilience rebate
+
+Based on reference F.4, we make the following assumptions for Indonesia:
+
+* Productivity of 1.10 kg/m/year
+* Assumed upper-end production cost of $0.60/kg
+
+We project an Indonesian aquaculture project that fully replaces the amount of rice lost in a temperature-induced disaster.
+
+```{r}
+
+calories.per.ton.of.rice <- 1000000 # back of the envelope
+
+aquaculture.productivity <- 1.1 # kg per year - unused rn
+aquaculture.cost <- 0.6 # per kg
+aquaculture.cost.per.ton <- aquaculture.cost * 1000
+
+# estimates based on F.5 - all estimates in this subsection are per 100 g
+carbs.per.seaweed.gram <- 25
+protein.per.seaweed.gram <- 15
+fat.per.seaweed.gram <- 0.5
+calories.per.carb.gram <- 4
+calories.per.fat.gram <- 4
+calories.per.protein.gram <- 9
+calories.per.ton.of.seaweed <- ((carbs.per.seaweed.gram*calories.per.carb.gram) + (protein.per.seaweed.gram * calories.per.protein.gram) + (fat.per.seaweed.gram * calories.per.fat.gram)) * (1000000/100) # 1m grams per tonne, but estimates are per 100h
+
+# calculate value of aquaculture project based on replacement cost
+lost.rice.calories <- base.rice.production*rice.production.lost*calories.per.ton.of.rice
+percentage.replaced <- 0.2
+aquaculture.replacement.cost <- (lost.rice.calories / calories.per.ton.of.seaweed) * aquaculture.cost.per.ton * percentage.replaced
+reduced.payout <- policy.amount*percentage.replaced
+
+# calculate rebate
+loss.curve.1 <- loss.curve - reduced.payout
+ep.1 <- get.ep.curve(loss.curve.1)
+plot(ep.1$amount, ep.1$prob, type="l", main="Probability of exceeding a given value of lost rice (USD)") # plot EP curve
+premium.1 <- calculate.average.rate(ep.1, policy.amount)
+rebate <- (premium - premium.1)
+
+# rebate value
+rebate
+
+# percentage of cost defrayed by rebate
+rebate/aquaculture.replacement.cost
+
+
+
+
+```
+
 
 # EP curves for differing assumptions
 
@@ -228,17 +323,18 @@ for (w in warming) {
 
 ```
 
-# Data sources
+
+# A. Data sources
 
 A. [Climate research unit - monthly temperature data](https://crudata.uea.ac.uk/cru/data/hrg/cru_ts_4.03/crucy.1905151143.v4.03/new_countries/)
 
-# End notes
+# B. End notes
 
 1. [Assessing risks of climate variability and climate change for Indonesian rice agriculture](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1876519/)
 2. [Plausible rice yield losses under future climate warming](https://www.nature.com/articles/nplants2016202#:~:text=More%20than%2080%25%20(67%20out,%25%20K%E2%88%921%20(Fig.)
 3. [Food security, farming and climate change to 2050](https://www.ifpri.org/publication/food-security-farming-and-climate-change-2050)
 
-# Modeling References
+# C. Modeling References
 
 1. [Catastrophe Modeling: Guidance for Non-Catastrophe Modellers](https://www.lmalloyds.com/lma/finance/Cat_Modelling_Guidance.aspx)
 2. [A Guide to Catastrophe Modeling](https://forms2.rms.com/rs/729-DJX-565/images/rms_guide_catastrophe_modeling_2008.pdf)
@@ -250,19 +346,28 @@ A. [Climate research unit - monthly temperature data](https://crudata.uea.ac.uk/
 Change: A Multi-Model Comparison](https://globalchange.mit.edu/sites/default/files/MITJPSPGC_Rpt290.pdf)
 8. [An Evaluation of Decadal Probability Forecasts from State-of-the-Art Climate Models](https://journals.ametsoc.org/jcli/article/26/23/9334/99441/An-Evaluation-of-Decadal-Probability-Forecasts)
   * Features "probability forecasts from ensembles" - using kernel dressing
+  
+# D. Insurance References
+1. [AIR guide](https://www.cia-ica.ca/docs/default-source/2018/218103e.pdf) on CAT bonds and pricing.
+2. [An example](https://www.chicagofed.org/publications/chicago-fed-letter/2018/405)
+3. [An analysis of the market price of CAT bonds](https://www.casact.org/pubs/forum/09spforum/02Bodoff.pdf)
+4. [Fundamentals of catastrophe modeling (presentation)](https://www.casact.org/education/rpm/2010/handouts/cmwa-hess.pdf)
+5. [Overview of deductible ratemaking](https://www.soa.org/globalassets/assets/Files/Research/Projects/research-2016-gi-deductible-ratemaking.pdf)
+6. [Worked example of CAT bond modeling](https://www.researchgate.net/publication/318990000_Uncertainty_Quantification_in_the_Design_of_Earthquake_Catastrophe_Bonds)
 
-# Indonesia
+# E. Indonesia
 * [Rice growing seasons in Indonesia](http://www.fao.org/3/y4347e/y4347e0x.htm)
 
-# Background
-* [Financing Catastrophe Risk for Famine Relief Using Early Warning Systems](http://globalagrisk.com/Pubs/2002%20Financing%20Catastrophe%20Risk%20for%20Famine%20Relief%20Using%20Early%20Warning%20jrs.pdf)
-* [2004 *Economist* article on potential WFP famine insurance](https://www.economist.com/finance-and-economics/2004/12/09/hedging-against-the-horsemen)
+# F. Aquaculture references
+1. [FAO guide to Eucheuma Seaweed](http://www.fao.org/3/AC287E/AC287E03.htm)
+2. [The Relative Caloric Prices of Healthy and Unhealthy Foods Differ Systematically across Income Levels and Continents](https://academic.oup.com/jn/article/149/11/2020/5535433)
+3. [The Future of Food from the Sea](https://oceanpanel.org/sites/default/files/2019-11/19_HLP_BP1%20Paper.pdf)
+4. [Seaweed Aquaculture for Food Security, Income Generation and Environmental Health in Tropical Developing Countries](http://documents1.worldbank.org/curated/en/947831469090666344/pdf/107147-WP-REVISED-Seaweed-Aquaculture-Web.pdf)
+5. [A comparison of nutritional value of underexploited edible seaweeds with recommended dietary allowances](https://www.sciencedirect.com/science/article/pii/S1018364719318130)
 
-# Aquaculture references
-* [The Relative Caloric Prices of Healthy and Unhealthy Foods Differ Systematically across Income Levels and Continents](https://academic.oup.com/jn/article/149/11/2020/5535433)
-* [The Future of Food from the Sea](https://oceanpanel.org/sites/default/files/2019-11/19_HLP_BP1%20Paper.pdf)
-
-# Helpful Miscellany
-* [Bond valuation on Investopedia](https://www.investopedia.com/terms/b/bond-valuation.asp)
-* [A useful blog post](https://understandinguncertainty.org/node/622)
-* [Overnight risk-free rates: A User's Guide](https://www.fsb.org/wp-content/uploads/P040619-1.pdf)
+# G. Helpful Miscellany
+1. [Financing Catastrophe Risk for Famine Relief Using Early Warning Systems](http://globalagrisk.com/Pubs/2002%20Financing%20Catastrophe%20Risk%20for%20Famine%20Relief%20Using%20Early%20Warning%20jrs.pdf)
+2. [2004 *Economist* article on potential WFP famine insurance](https://www.economist.com/finance-and-economics/2004/12/09/hedging-against-the-horsemen)
+3. [Bond valuation on Investopedia](https://www.investopedia.com/terms/b/bond-valuation.asp)
+4. [A useful blog post](https://understandinguncertainty.org/node/622)
+5. [Overnight risk-free rates: A User's Guide](https://www.fsb.org/wp-content/uploads/P040619-1.pdf)
